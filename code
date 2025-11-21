@@ -1,0 +1,907 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+# ML Libraries
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score, train_test_split
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, mean_squared_error
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBClassifier, XGBRegressor
+import xgboost as xgb
+from scipy import stats
+import joblib
+# Set up plotting style
+plt.style.use('seaborn-v0_8')
+print("🚀 Loading F1 datasets...")
+
+#loading the files 
+
+races = pd.read_csv('races.csv')
+drivers = pd.read_csv('drivers.csv')
+constructors = pd.read_csv('constructors.csv')
+results = pd.read_csv('results.csv')
+qualifying = pd.read_csv('qualifying.csv')
+lap_times = pd.read_csv('lap_times.csv')
+pit_stops = pd.read_csv('pit_stops.csv')
+driver_standings = pd.read_csv('driver_standings.csv')
+circuits = pd.read_csv('circuits.csv')
+print("✅ Datasets loaded successfully!")
+
+available_years = races['year'].unique()
+
+target_year = 2025
+reference_year = 2024  
+
+if 2024 not in available_years:
+    raise ValueError("2024 data is required to predict 2025 season.")
+print(f"📅 Available years in dataset: {sorted(available_years)}")
+print(f"🎯 Predicting {target_year} season using {reference_year} drivers/teams")
+
+
+races_reference = races[races['year'] == reference_year].copy()
+print(f"🏁 {reference_year} Season: {len(races_reference)} races found")
+
+
+print(f"📋 Races in {reference_year}:")
+print(races_reference[['name', 'date', 'round']].head())
+
+results_target = results.merge(races_reference[['raceId', 'round', 'name', 'circuitId', 'date']], on='raceId')
+results_target = results_target.merge(drivers[['driverId', 'code', 'forename', 'surname', 'nationality']], on='driverId')
+results_target = results_target.merge(constructors[['constructorId', 'name', 'nationality']], on='constructorId', suffixes=('_driver', '_constructor'))
+results_target = results_target.merge(circuits[['circuitId', 'name', 'country']], on='circuitId', suffixes=('_race', '_circuit'))
+
+# Add driver full name and team
+results_target['driver_name'] = results_target['forename'] + ' ' + results_target['surname']
+results_target['team'] = results_target['name_constructor']  # Constructor name
+
+print(f"🔍 Columns in results: {list(results_target.columns)}")
+
+# Clean and convert position data
+print("🔄 Cleaning and converting position data...")
+results_target['position'] = pd.to_numeric(results_target['position'], errors='coerce')
+results_target['grid'] = pd.to_numeric(results_target['grid'], errors='coerce')
+results_target['points'] = pd.to_numeric(results_target['points'], errors='coerce')
+results_target['laps'] = pd.to_numeric(results_target['laps'], errors='coerce')
+
+# Remove rows where position is NaN (DNF, DNS, etc.)
+results_clean = results_target.dropna(subset=['position']).copy()
+print(f"📊 {reference_year} Results: {len(results_clean)} finished races from {results_clean['driver_name'].nunique()} drivers")
+
+def calculate_driver_metrics(df):
+    """Calculate comprehensive driver performance metrics"""
+    # Basic metrics using safe aggregation
+    basic_metrics = df.groupby(['driver_name', 'team']).agg({
+        'points': ['sum', 'mean'],
+        'position': 'count',
+        'grid': 'mean',
+        'laps': 'sum'
+    }).round(2)
+    basic_metrics.columns = ['total_points', 'avg_points', 'races_finished', 'avg_grid_position', 'total_laps']
+    basic_metrics = basic_metrics.reset_index()
+    # Calculate additional metrics manually
+    wins = df[df['position'] == 1].groupby(['driver_name', 'team']).size().reset_index(name='wins')
+    podiums = df[df['position'] <= 3].groupby(['driver_name', 'team']).size().reset_index(name='podiums')
+    top10s = df[df['position'] <= 10].groupby(['driver_name', 'team']).size().reset_index(name='top10s')
+    # Calculate average finish position separately
+    avg_finish = df.groupby(['driver_name', 'team'])['position'].mean().round(2).reset_index(name='avg_finish_position')
+    # Merge all metrics
+    metrics = basic_metrics.merge(avg_finish, on=['driver_name', 'team'], how='left')
+    metrics = metrics.merge(wins, on=['driver_name', 'team'], how='left')
+    metrics = metrics.merge(podiums, on=['driver_name', 'team'], how='left')
+    metrics = metrics.merge(top10s, on=['driver_name', 'team'], how='left')
+    # Fill NaN values with 0
+    metrics[['wins', 'podiums', 'top10s']] = metrics[['wins', 'podiums', 'top10s']].fillna(0)
+    # Calculate rates and efficiencies
+    metrics['points_per_race'] = (metrics['total_points'] / metrics['races_finished']).round(2)
+    metrics['win_rate'] = (metrics['wins'] / metrics['races_finished'] * 100).round(2)
+    metrics['podium_rate'] = (metrics['podiums'] / metrics['races_finished'] * 100).round(2)
+    metrics['top10_rate'] = (metrics['top10s'] / metrics['races_finished'] * 100).round(2)
+    # Calculate position gains
+    position_gains = []
+    for (driver, team), group in df.groupby(['driver_name', 'team']):
+        valid_races = group.dropna(subset=['grid', 'position'])
+        if len(valid_races) > 0:
+            avg_gain = (valid_races['grid'] - valid_races['position']).mean()
+        else:
+            avg_gain = 0
+        position_gains.append({'driver_name': driver, 'team': team, 'avg_position_gain': round(avg_gain, 2)})
+    position_gains_df = pd.DataFrame(position_gains)
+    metrics = metrics.merge(position_gains_df, on=['driver_name', 'team'], how='left')
+    return metrics
+
+driver_metrics = calculate_driver_metrics(results_clean)
+
+print("🎯 Analyzing qualifying performance...")
+qualifying_target = qualifying.merge(races_reference[['raceId', 'round', 'name']], on='raceId')
+qualifying_target = qualifying_target.merge(drivers[['driverId', 'code', 'forename', 'surname']], on='driverId')
+qualifying_target = qualifying_target.merge(constructors[['constructorId', 'name']], on='constructorId', suffixes=('_driver', '_constructor'))
+qualifying_target['driver_name'] = qualifying_target['forename'] + ' ' + qualifying_target['surname']
+qualifying_target['team'] = qualifying_target['name_constructor']
+
+print(f"🔍 Columns in qualifying: {list(qualifying_target.columns)}")
+
+# Clean qualifying data
+qualifying_target['position'] = pd.to_numeric(qualifying_target['position'], errors='coerce')
+
+# Calculate qualifying metrics
+qualifying_metrics = qualifying_target.groupby(['driver_name', 'team']).agg({
+    'position': ['mean', 'min', 'max', 'count']
+}).round(2)
+qualifying_metrics.columns = ['avg_qualifying', 'best_qualifying', 'worst_qualifying', 'qualifying_count']
+qualifying_metrics = qualifying_metrics.reset_index()
+
+# Merge qualifying metrics
+driver_metrics = driver_metrics.merge(qualifying_metrics, on=['driver_name', 'team'], how='left')
+
+print("⏱️ Analyzing lap time consistency...")
+lap_times_target = lap_times.merge(races_reference[['raceId']], on='raceId')
+lap_times_target = lap_times_target.merge(drivers[['driverId', 'forename', 'surname']], on='driverId')
+lap_times_target['driver_name'] = lap_times_target['forename'] + ' ' + lap_times_target['surname']
+
+# Calculate lap time consistency metrics
+if len(lap_times_target) > 0:
+    try:
+        print(f"📋 Lap time data sample: {len(lap_times_target)} records")
+        # Group by driver and race for lap consistency
+        lap_consistency = lap_times_target.groupby(['driver_name', 'raceId']).agg({
+            'milliseconds': ['mean', 'std']
+        }).round(2)
+        lap_consistency.columns = ['avg_lap_time', 'lap_std']
+        lap_consistency = lap_consistency.reset_index()
+        consistency_metrics = lap_consistency.groupby('driver_name').agg({
+            'avg_lap_time': 'mean',
+            'lap_std': 'mean'
+        }).round(2)
+        consistency_metrics['consistency_score'] = (100 - (consistency_metrics['lap_std'] / consistency_metrics['avg_lap_time'] * 1000)).round(2)
+        driver_metrics = driver_metrics.merge(consistency_metrics, on='driver_name', how='left')
+        print("✅ Lap time analysis completed successfully")
+    except Exception as e:
+        print(f"⚠️ Lap time analysis skipped: {e}")
+else:
+    print("⚠️ No lap time data available for analysis")
+
+print("📈 Analyzing championship progression...")
+standings_target = driver_standings.merge(races_reference[['raceId', 'round', 'name', 'date']], on='raceId')
+standings_target = standings_target.merge(drivers[['driverId', 'forename', 'surname']], on='driverId')
+standings_target['driver_name'] = standings_target['forename'] + ' ' + standings_target['surname']
+standings_target = standings_target.sort_values(['driver_name', 'round'])
+
+# Calculate championship progression
+standings_target['points_progression'] = standings_target.groupby('driver_name')['points'].cumsum()
+
+def calculate_performance_index(row):
+    """Calculate comprehensive performance index"""
+    # Handle missing values
+    points_score = min(row.get('points_per_race', 0) * 5, 100) if pd.notna(row.get('points_per_race')) else 0
+    if pd.isna(row.get('consistency_score')):
+        consistency_score = 50
+    else:
+        consistency_score = max(0, min(row['consistency_score'], 100))
+    if pd.isna(row.get('avg_qualifying')):
+        qualifying_score = 0
+    else:
+        qualifying_score = max(0, (20 - row['avg_qualifying']) * 5)
+    position_gain = row.get('avg_position_gain', 0)
+    position_gain_score = max(0, min(position_gain * 10 + 50, 100)) if pd.notna(position_gain) else 50
+    podium_score = min(row.get('podium_rate', 0) * 2, 100) if pd.notna(row.get('podium_rate')) else 0
+    finish_score = min(row.get('top10_rate', 0), 100) if pd.notna(row.get('top10_rate')) else 0
+    # Weighted average
+    weights = {
+        'points': 0.25,
+        'consistency': 0.20,
+        'qualifying': 0.15,
+        'position_gain': 0.15,
+        'podium': 0.15,
+        'finish': 0.10
+    }
+    performance_index = (
+        points_score * weights['points'] +
+        consistency_score * weights['consistency'] +
+        qualifying_score * weights['qualifying'] +
+        position_gain_score * weights['position_gain'] +
+        podium_score * weights['podium'] +
+        finish_score * weights['finish']
+    )
+    return round(performance_index, 2)
+
+driver_metrics['performance_index'] = driver_metrics.apply(calculate_performance_index, axis=1)
+driver_metrics = driver_metrics.sort_values('performance_index', ascending=False)
+
+# Fill NaN values for visualization
+driver_metrics.fillna(0, inplace=True)
+print("🎨 Creating visualizations...")
+'''
+plt.figure(figsize=(16, 12))
+colors = plt.cm.viridis(np.linspace(0, 1, len(driver_metrics)))
+bars = plt.barh(range(len(driver_metrics)), driver_metrics['performance_index'], color=colors, alpha=0.8)
+# Customize the plot
+plt.title(f'🏆 {reference_year} F1 Driver Performance Index Ranking\n(Comprehensive Multi-Metric Assessment)', 
+          fontsize=18, fontweight='bold', pad=20)
+plt.xlabel('Performance Index (0-100 Scale)', fontsize=14)
+plt.ylabel('Driver', fontsize=14)
+plt.yticks(range(len(driver_metrics)), driver_metrics['driver_name'])
+# Add value labels on bars
+for i, (bar, value) in enumerate(zip(bars, driver_metrics['performance_index'])):
+    plt.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2, f'{value:.1f}', 
+             va='center', fontweight='bold', fontsize=10)
+plt.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(16, 10))
+top_drivers = driver_metrics.head(8)['driver_name'].tolist()
+
+colors = plt.cm.Set3(np.linspace(0, 1, len(top_drivers)))
+for i, driver in enumerate(top_drivers):
+    driver_data = standings_target[standings_target['driver_name'] == driver]
+    if not driver_data.empty:
+        plt.plot(driver_data['round'], driver_data['points_progression'], 
+                 marker='o', linewidth=3, label=driver, markersize=8, color=colors[i],
+                 markerfacecolor='white', markeredgewidth=2)
+plt.title(f'📈 {reference_year} F1 Championship Points Progression\n(Top 8 Drivers)', 
+          fontsize=18, fontweight='bold', pad=20)
+plt.xlabel('Race Round', fontsize=14)
+plt.ylabel('Cumulative Points', fontsize=14)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+plt.grid(True, alpha=0.3)
+plt.xticks(range(1, int(standings_target['round'].max()) + 1))
+plt.tight_layout()
+plt.show()
+
+if 'avg_qualifying' in driver_metrics.columns and (driver_metrics['avg_qualifying'] > 0).any():
+    plt.figure(figsize=(14, 10))
+    # Create scatter plot
+    scatter = plt.scatter(driver_metrics['avg_qualifying'], driver_metrics['avg_finish_position'],
+                         c=driver_metrics['performance_index'], s=100, alpha=0.7, cmap='RdYlGn')
+    # Add driver labels
+    for i, row in driver_metrics.iterrows():
+        plt.annotate(row['driver_name'].split()[-1], 
+                    (row['avg_qualifying'] + 0.1, row['avg_finish_position'] + 0.1),
+                    fontsize=9, alpha=0.8)
+    plt.colorbar(scatter, label='Performance Index')
+    plt.title(f'🔥 {reference_year} Qualifying vs Race Performance\n(Size = Performance Index)', 
+              fontsize=16, fontweight='bold', pad=20)
+    plt.xlabel('Average Qualifying Position (Lower = Better)', fontsize=12)
+    plt.ylabel('Average Finish Position (Lower = Better)', fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def create_radar_chart(team_data, categories, title):
+    """Create a radar chart for team performance comparison"""
+    from math import pi
+    # Number of variables
+    N = len(categories)
+  
+    angles = [n / float(N) * 2 * pi for n in range(N)]
+    angles += angles[:1]  
+    # Initialise the spider plot
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+    # Plot each team
+    colors = plt.cm.viridis(np.linspace(0, 1, len(team_data)))
+    for i, (team, values) in enumerate(team_data.items()):
+        values += values[:1]  
+        ax.plot(angles, values, linewidth=2, label=team, marker='o', color=colors[i])
+        ax.fill(angles, values, alpha=0.1, color=colors[i])
+    # Add category labels
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories)
+    # Add yticks and grid
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.grid(True)
+    # Add legend and title
+    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+    plt.title(title, size=16, fontweight='bold', pad=20)
+    plt.show()
+
+# Prepare data for radar chart (top 3 teams)
+top_teams = driver_metrics.groupby('team')['performance_index'].mean().nlargest(3).index
+if len(top_teams) >= 2:
+    team_radar_data = {}
+    categories = ['Points/ Race', 'Qualifying', 'Race Finish', 'Consistency', 'Position Gain']
+    for team in top_teams:
+        team_data = driver_metrics[driver_metrics['team'] == team].iloc[0]
+        values = [
+            min(team_data.get('points_per_race', 0) * 2, 100),
+            min((20 - team_data.get('avg_qualifying', 20)) * 5, 100) if team_data.get('avg_qualifying', 0) > 0 else 50,
+            min((20 - team_data.get('avg_finish_position', 20)) * 5, 100),
+            team_data.get('consistency_score', 50),
+            min(team_data.get('avg_position_gain', 0) * 20 + 50, 100)
+        ]
+        team_radar_data[team] = values
+    create_radar_chart(team_radar_data, categories, f'📊 {reference_year} Top Team Performance Radar Comparison')
+
+    plt.figure(figsize=(14, 10))
+gain_data = driver_metrics[driver_metrics['avg_position_gain'] != 0].sort_values('avg_position_gain', ascending=False)
+
+scatter = plt.scatter(gain_data['avg_position_gain'], range(len(gain_data)), 
+                     c=gain_data['wins'], s=gain_data['podiums']*50 + 100, 
+                     cmap='Reds', alpha=0.7, edgecolors='black')
+plt.title(f'📊 {reference_year} Position Gains Analysis\n(Size = Podiums, Color = Wins)', 
+          fontsize=16, fontweight='bold', pad=20)
+plt.xlabel('Average Position Gain/Loss per Race', fontsize=12)
+plt.ylabel('Driver', fontsize=12)
+plt.yticks(range(len(gain_data)), gain_data['driver_name'])
+plt.axvline(x=0, color='red', linestyle='--', alpha=0.5)
+# Add colorbar
+cbar = plt.colorbar(scatter)
+cbar.set_label('Number of Wins', rotation=270, labelpad=15)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(15, 8))
+
+race_performance = results_clean.pivot_table(index='driver_name', columns='round', 
+                                            values='position', aggfunc='mean')
+
+top_drivers_heatmap = driver_metrics.head(10)['driver_name'].tolist()
+race_performance = race_performance.loc[top_drivers_heatmap]
+
+plt.imshow(race_performance.values, cmap='RdYlGn_r', aspect='auto', interpolation='nearest')
+# Add labels
+plt.xticks(range(len(race_performance.columns)), race_performance.columns)
+plt.yticks(range(len(race_performance.index)), [name.split()[-1] for name in race_performance.index])
+# Add value annotations
+for i in range(len(race_performance.index)):
+    for j in range(len(race_performance.columns)):
+        plt.text(j, i, f'{race_performance.iloc[i, j]:.1f}', 
+                ha='center', va='center', fontsize=8, fontweight='bold')
+plt.colorbar(label='Finish Position (Lower = Better)')
+plt.title(f'🏁 {reference_year} Race-by-Race Performance Heatmap\n(Top 10 Drivers by Performance Index)', 
+          fontsize=16, fontweight='bold', pad=20)
+plt.xlabel('Race Round', fontsize=12)
+plt.ylabel('Driver', fontsize=12)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(16, 10))
+
+team_standings = results_clean.groupby(['round', 'team'])['points'].sum().reset_index()
+team_standings['cumulative_points'] = team_standings.groupby('team')['points'].cumsum()
+top_teams = team_standings.groupby('team')['cumulative_points'].max().nlargest(6).index
+colors = plt.cm.tab10(np.linspace(0, 1, len(top_teams)))
+for i, team in enumerate(top_teams):
+    team_data = team_standings[team_standings['team'] == team]
+    if not team_data.empty:
+        plt.plot(team_data['round'], team_data['cumulative_points'], 
+                 marker='s', linewidth=3, label=team, markersize=6, color=colors[i])
+plt.title(f'🏆 {reference_year} Team Championship Progress Comparison\n(Top 6 Teams)', 
+          fontsize=18, fontweight='bold', pad=20)
+plt.xlabel('Race Round', fontsize=14)
+plt.ylabel('Cumulative Constructor Points', fontsize=14)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True, alpha=0.3)
+plt.xticks(range(1, int(team_standings['round'].max()) + 1))
+plt.tight_layout()
+plt.show()
+'''
+
+print("\n" + "="*80)
+print("🤖  MACHINE LEARNING IMPLEMENTATION (2015-2024)")
+print("="*80)
+# 🔽 UPDATED: Train on 2015–2024 (inclusive)
+historical_start_year = 2015
+historical_end_year = 2024  
+print(f"📊 Training on historical data from {historical_start_year} to {historical_end_year}")
+historical_races = races[(races['year'] >= historical_start_year) & (races['year'] <= historical_end_year)].copy()
+historical_results = results[results['raceId'].isin(historical_races['raceId'])].copy()
+historical_qualifying = qualifying[qualifying['raceId'].isin(historical_races['raceId'])].copy()
+
+def prepare_race_winner_features(results_df, qualifying_df, races_df, drivers_df, constructors_df):
+    """
+    Prepare features for race winner prediction using historical data
+    """
+   
+    merged = results_df.copy()
+    # Add driver info
+    merged = merged.merge(drivers_df[['driverId', 'forename', 'surname']], on='driverId')
+    merged['driver_name'] = merged['forename'] + ' ' + merged['surname']
+    # Add constructor info
+    merged = merged.merge(constructors_df[['constructorId', 'name']], on='constructorId')
+    merged.rename(columns={'name': 'team'}, inplace=True)
+    # Add race info
+    merged = merged.merge(races_df[['raceId', 'year', 'round', 'circuitId']], on='raceId')
+    # Add qualifying info
+    qualifying_clean = qualifying_df[['raceId', 'driverId', 'position']].copy()
+    qualifying_clean.rename(columns={'position': 'qualifying_pos'}, inplace=True)
+    merged = merged.merge(qualifying_clean, on=['raceId', 'driverId'], how='left')
+    # Clean position data
+    merged['position'] = pd.to_numeric(merged['position'], errors='coerce')
+    merged['qualifying_pos'] = pd.to_numeric(merged['qualifying_pos'], errors='coerce')
+    merged['grid'] = pd.to_numeric(merged['grid'], errors='coerce')
+    # Create target variable (1 if race winner, 0 otherwise)
+    merged['is_winner'] = (merged['position'] == 1).astype(int)
+    # Calculate historical features (using data from previous races only)
+    features_list = []
+    for race_id in merged['raceId'].unique():
+        race_data = merged[merged['raceId'] == race_id].copy()
+        race_year = race_data['year'].iloc[0]
+        race_round = race_data['round'].iloc[0]
+        # Get historical data before this race
+        historical = merged[
+            (merged['year'] < race_year) | 
+            ((merged['year'] == race_year) & (merged['round'] < race_round))
+        ]
+        if historical.empty:
+            # Use default values for first race
+            race_data['driver_avg_points'] = 0
+            race_data['driver_win_rate'] = 0
+            race_data['driver_avg_qualifying'] = 10
+            race_data['team_avg_points'] = 0
+            race_data['driver_experience'] = 0
+        else:
+            # Driver historical performance
+            driver_stats = historical.groupby('driver_name').agg({
+                'points': 'mean',
+                'position': lambda x: (x == 1).mean(),
+                'qualifying_pos': 'mean'
+            }).reset_index()
+            driver_stats.columns = ['driver_name', 'driver_avg_points', 'driver_win_rate', 'driver_avg_qualifying']
+            # Team historical performance
+            team_stats = historical.groupby('team')['points'].mean().reset_index()
+            team_stats.columns = ['team', 'team_avg_points']
+            # Driver experience (number of races)
+            driver_exp = historical.groupby('driver_name').size().reset_index(name='driver_experience')
+            # Merge historical features
+            race_data = race_data.merge(driver_stats, on='driver_name', how='left')
+            race_data = race_data.merge(team_stats, on='team', how='left')
+            race_data = race_data.merge(driver_exp, on='driver_name', how='left')
+            # Fill missing values
+            race_data['driver_avg_points'] = race_data['driver_avg_points'].fillna(0)
+            race_data['driver_win_rate'] = race_data['driver_win_rate'].fillna(0)
+            race_data['driver_avg_qualifying'] = race_data['driver_avg_qualifying'].fillna(10)
+            race_data['team_avg_points'] = race_data['team_avg_points'].fillna(0)
+            race_data['driver_experience'] = race_data['driver_experience'].fillna(0)
+        features_list.append(race_data)
+    # Combine all features
+    full_features = pd.concat(features_list, ignore_index=True)
+    # Add current race features
+    full_features['current_qualifying'] = full_features['qualifying_pos'].fillna(full_features['grid'])
+    full_features['starting_position'] = full_features['current_qualifying'].fillna(10)
+    # Select final features
+    feature_cols = [
+        'driver_avg_points', 'driver_win_rate', 'driver_avg_qualifying',
+        'team_avg_points', 'driver_experience', 'starting_position'
+    ]
+    # Ensure all features are numeric
+    for col in feature_cols:
+        full_features[col] = pd.to_numeric(full_features[col], errors='coerce').fillna(0)
+    return full_features, feature_cols
+
+def train_real_winner_model(results_df, qualifying_df, races_df, drivers_df, constructors_df):
+   
+    print("🧠 Training REAL Race Winner Prediction Model...")
+    # Prepare features
+    features_df, feature_cols = prepare_race_winner_features(
+        results_df, qualifying_df, races_df, drivers_df, constructors_df
+    )
+    # Remove rows with missing target
+    features_df = features_df.dropna(subset=['is_winner'])
+    if len(features_df) == 0:
+        print("⚠️ Not enough data for training")
+        return None, None, None
+    print(f"   ✅ Prepared {len(features_df)} race entries with {len(feature_cols)} features")
+    # Separate features and target
+    X = features_df[feature_cols]
+    y = features_df['is_winner']
+    # Time-series cross-validation
+    tscv = TimeSeriesSplit(n_splits=5)
+    # Initialize models
+    models = {
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'XGBoost': XGBClassifier(n_estimators=100, random_state=42, use_label_encoder=False, eval_metric='logloss')
+    }
+    best_model = None
+    best_score = 0
+    model_results = {}
+    for name, model in models.items():
+        print(f"   📊 Training {name}...")
+        # Time-series cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=tscv, scoring='roc_auc', n_jobs=-1)
+        avg_score = cv_scores.mean()
+        model_results[name] = {
+            'cv_scores': cv_scores,
+            'mean_auc': avg_score,
+            'std_auc': cv_scores.std()
+        }
+        print(f"      • AUC-ROC: {avg_score:.3f} ± {cv_scores.std():.3f}")
+        if avg_score > best_score:
+            best_score = avg_score
+            best_model = model
+    # Train best model on full dataset
+    print(f"\n   🏆 Best Model: {best_model.__class__.__name__} (AUC: {best_score:.3f})")
+    best_model.fit(X, y)
+    # Feature importance
+    if hasattr(best_model, 'feature_importances_'):
+        importance_df = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': best_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print("\n   🔍 Feature Importance:")
+        for _, row in importance_df.iterrows():
+            print(f"      • {row['feature']}: {row['importance']:.3f}")
+    return best_model, X, y
+
+# Train the model on 2015-2024 data
+model, X_train, y_train = train_real_winner_model(
+    historical_results, 
+    historical_qualifying, 
+    historical_races, 
+    drivers, 
+    constructors
+)
+
+def prepare_current_season_features(results_clean, qualifying_target, races_target, drivers_df, constructors_df, historical_results, historical_qualifying, historical_races):
+    """
+    Prepare features for current season using historical statistics
+    """
+   
+    current_data = results_clean.copy()
+    
+    qualifying_map = qualifying_target.set_index(['raceId', 'driverId'])['position'].to_dict()
+    current_data['qualifying_pos'] = current_data.apply(
+        lambda row: qualifying_map.get((row['raceId'], row['driverId']), row['grid']), axis=1
+    )
+    # Prepare historical data for stats calculation
+    historical_merged = historical_results.copy()
+    historical_merged = historical_merged.merge(drivers_df[['driverId', 'forename', 'surname']], on='driverId')
+    historical_merged['driver_name'] = historical_merged['forename'] + ' ' + historical_merged['surname']
+    historical_merged = historical_merged.merge(constructors_df[['constructorId', 'name']], on='constructorId')
+    historical_merged.rename(columns={'name': 'team'}, inplace=True)
+    historical_merged = historical_merged.merge(historical_races[['raceId', 'year', 'round']], on='raceId')
+    # Add historical qualifying
+    historical_qualifying_clean = historical_qualifying[['raceId', 'driverId', 'position']].copy()
+    historical_qualifying_clean.rename(columns={'position': 'qualifying_pos'}, inplace=True)
+    historical_merged = historical_merged.merge(historical_qualifying_clean, on=['raceId', 'driverId'], how='left')
+    # Clean historical data
+    historical_merged['position'] = pd.to_numeric(historical_merged['position'], errors='coerce')
+    historical_merged['qualifying_pos'] = pd.to_numeric(historical_merged['qualifying_pos'], errors='coerce')
+    # Calculate historical stats
+    driver_stats = historical_merged.groupby('driver_name').agg({
+        'points': 'mean',
+        'position': lambda x: (x == 1).mean(),
+        'qualifying_pos': 'mean'
+    }).reset_index()
+    driver_stats.columns = ['driver_name', 'driver_avg_points', 'driver_win_rate', 'driver_avg_qualifying']
+    team_stats = historical_merged.groupby('team')['points'].mean().reset_index()
+    team_stats.columns = ['team', 'team_avg_points']
+    driver_exp = historical_merged.groupby('driver_name').size().reset_index(name='driver_experience')
+    # Merge historical stats with current data
+    current_features = current_data.merge(driver_stats, on='driver_name', how='left')
+    current_features = current_features.merge(team_stats, on='team', how='left')
+    current_features = current_features.merge(driver_exp, on='driver_name', how='left')
+    # Fill missing values for new drivers/teams
+    current_features['driver_avg_points'] = current_features['driver_avg_points'].fillna(0)
+    current_features['driver_win_rate'] = current_features['driver_win_rate'].fillna(0)
+    current_features['driver_avg_qualifying'] = current_features['driver_avg_qualifying'].fillna(10)
+    current_features['team_avg_points'] = current_features['team_avg_points'].fillna(0)
+    current_features['driver_experience'] = current_features['driver_experience'].fillna(0)
+    # Add current race features
+    current_features['current_qualifying'] = current_features['qualifying_pos'].fillna(current_features['grid'])
+    current_features['starting_position'] = current_features['current_qualifying'].fillna(10)
+    feature_cols = [
+        'driver_avg_points', 'driver_win_rate', 'driver_avg_qualifying',
+        'team_avg_points', 'driver_experience', 'starting_position'
+    ]
+    # Ensure all features are numeric
+    for col in feature_cols:
+        current_features[col] = pd.to_numeric(current_features[col], errors='coerce').fillna(0)
+    return current_features, feature_cols
+
+# Make predictions for 2025 season using 2024 drivers/teams
+if model is not None:
+    print("\n✅ REAL MODEL TRAINED SUCCESSFULLY!")
+    # Predict for 2025 season
+    print(f"\n🔮 Making predictions for {target_year} season using {reference_year} drivers/teams...")
+    try:
+       
+        current_features, feature_cols = prepare_current_season_features(
+            results_clean,
+            qualifying_target,
+            races_reference,
+            drivers,
+            constructors,
+            historical_results,
+            historical_qualifying,
+            historical_races
+        )
+        # Make predictions
+        current_features = current_features.dropna(subset=feature_cols)
+        if len(current_features) > 0:
+            X_current = current_features[feature_cols]
+            current_features['win_probability'] = model.predict_proba(X_current)[:, 1]
+            # Show top predictions
+            predictions = current_features[['driver_name', 'team', 'win_probability']].groupby(
+                ['driver_name', 'team']
+            )['win_probability'].mean().sort_values(ascending=False).head(10)
+            print(f"\n🏆 Race Winner Probability Predictions for {target_year}:")
+            for i, (driver_team, prob) in enumerate(predictions.items(), 1):
+                if isinstance(driver_team, tuple):
+                    driver, team = driver_team
+                else:
+                    driver = driver_team
+                    team = current_features[current_features['driver_name'] == driver]['team'].iloc[0]
+                print(f"   {i}. {driver} ({team}): {prob:.1%}")
+        # Model evaluation metrics
+        y_pred = model.predict(X_train)
+        y_pred_proba = model.predict_proba(X_train)[:, 1]
+        print("\n📊 Model Performance on Training Data:")
+        print(f"   • Accuracy: {accuracy_score(y_train, y_pred):.3f}")
+        print(f"   • Precision: {precision_score(y_train, y_pred, zero_division=0):.3f}")
+        print(f"   • Recall: {recall_score(y_train, y_pred):.3f}")
+        print(f"   • F1-Score: {f1_score(y_train, y_pred):.3f}")
+        print(f"   • AUC-ROC: {roc_auc_score(y_train, y_pred_proba):.3f}")
+    except Exception as e:
+        print(f"⚠️ Error making predictions: {e}")
+        print("Skipping prediction step...")
+
+print("\n" + "="*80)
+print("🔬  ML  FOR DRIVER PERFORMANCE ANALYSIS")
+print("="*80)
+
+# 1. Driver Performance Clustering
+def perform_driver_clustering(driver_metrics):
+    """Perform clustering on driver performance metrics"""
+    print("📊 Performing Driver Performance Clustering...")
+    # Select clustering features
+    cluster_features = ['performance_index', 'consistency_score', 'avg_qualifying', 
+                       'avg_finish_position', 'points_per_race', 'avg_position_gain']
+    # Prepare data
+    cluster_data = driver_metrics[cluster_features].copy()
+    cluster_data = cluster_data.fillna(cluster_data.mean())
+    # Standardize features
+    scaler = StandardScaler()
+    cluster_scaled = scaler.fit_transform(cluster_data)
+    # Determine optimal number of clusters using elbow method
+    inertias = []
+    K_range = range(2, 8)
+    for k in K_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(cluster_scaled)
+        inertias.append(kmeans.inertia_)
+    # Plot elbow curve
+    plt.figure(figsize=(10, 6))
+    plt.plot(K_range, inertias, 'bo-')
+    plt.xlabel('Number of Clusters (k)')
+    plt.ylabel('Inertia')
+    plt.title('Elbow Method for Optimal k')
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    # Use k=4 clusters (Elite, Consistent, Developing, Struggling)
+    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+    driver_metrics['cluster'] = kmeans.fit_predict(cluster_scaled)
+    # Map clusters to meaningful labels
+    cluster_labels = {0: 'Elite', 1: 'Consistent', 2: 'Developing', 3: 'Struggling'}
+    driver_metrics['performance_cluster'] = driver_metrics['cluster'].map(cluster_labels)
+    # Visualize clusters
+    plt.figure(figsize=(12, 8))
+    scatter = plt.scatter(driver_metrics['performance_index'], 
+                         driver_metrics['consistency_score'],
+                         c=driver_metrics['cluster'], cmap='viridis', s=100, alpha=0.7)
+    plt.xlabel('Performance Index')
+    plt.ylabel('Consistency Score')
+    plt.title('Driver Performance Clusters')
+    plt.colorbar(scatter)
+    # Add driver labels
+    for i, row in driver_metrics.iterrows():
+        plt.annotate(row['driver_name'].split()[-1], 
+                    (row['performance_index'] + 1, row['consistency_score']),
+                    fontsize=8)
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    print("   ✅ Clustering completed with 4 performance categories")
+    print("   📊 Cluster Distribution:")
+    print(driver_metrics['performance_cluster'].value_counts().sort_index())
+    return driver_metrics
+
+# Perform clustering
+if len(driver_metrics) > 0:
+    driver_metrics = perform_driver_clustering(driver_metrics)
+
+def forecast_championship_points(standings_target, driver_metrics):
+    """Forecast final championship points using time series forecasting"""
+    print("📈 Forecasting Championship Points...")
+    # Get current standings
+    current_standings = standings_target.groupby('driver_name')['points'].sum().reset_index()
+    current_standings = current_standings.merge(
+        driver_metrics[['driver_name', 'points_per_race']], on='driver_name', how='left'
+    )
+   
+    total_races_in_season = races[races['year'] == reference_year]['round'].max()
+    current_round = standings_target['round'].max()
+    remaining_races = total_races_in_season - current_round
+    # Simple forecasting based on points per race
+    current_standings['forecasted_points'] = (
+        current_standings['points'] + 
+        (current_standings['points_per_race'] * remaining_races)
+    ).round(0)
+    # Sort by forecasted points
+    forecast_standings = current_standings.sort_values('forecasted_points', ascending=False)
+    # Visualize forecast
+    plt.figure(figsize=(14, 8))
+    top_8 = forecast_standings.head(8)
+    x_pos = np.arange(len(top_8))
+    plt.bar(x_pos - 0.2, top_8['forecasted_points'], width=0.4,
+            color='lightblue', alpha=0.7, label='Forecasted')
+    
+    plt.xlabel('Driver')
+    plt.ylabel('Championship Points')
+    plt.title(f'Championship Points Forecast - {reference_year} Season')
+    plt.xticks(x_pos, [name.split()[-1] for name in top_8['driver_name']], rotation=45)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    print("   ✅ Championship forecasting completed")
+    print("   🏆 Top 5 Forecasted Championship Standings:")
+    for i, (_, row) in enumerate(forecast_standings.head(5).iterrows(), 1):
+        print(f"      {i}. {row['driver_name']}: {row['forecasted_points']:.0f} points")
+    return forecast_standings
+
+# Perform forecasting
+if len(standings_target) > 0:
+    forecast_results = forecast_championship_points(standings_target, driver_metrics)
+
+def build_lap_time_predictor(lap_times, races, drivers, results):
+    """Build a model to predict lap times based on driver and circuit characteristics"""
+    print("⏱️ Building Lap Time Prediction Model...")
+    # Filter data for recent years (2015-2023)
+    recent_races = races[(races['year'] >= 2015) & (races['year'] <= 2023)]
+    lap_data = lap_times[lap_times['raceId'].isin(recent_races['raceId'])].copy()
+    if len(lap_data) == 0:
+        print("   ⚠️ Insufficient lap time data for modeling")
+        return None
+    # Merge with race and driver info
+    lap_data = lap_data.merge(races[['raceId', 'year', 'circuitId']], on='raceId')
+    lap_data = lap_data.merge(drivers[['driverId', 'forename', 'surname']], on='driverId')
+    lap_data['driver_name'] = lap_data['forename'] + ' ' + lap_data['surname']
+    # Get driver performance metrics from results
+    driver_perf = results[results['raceId'].isin(recent_races['raceId'])].copy()
+    driver_perf = driver_perf.merge(drivers[['driverId', 'forename', 'surname']], on='driverId')
+    driver_perf['driver_name'] = driver_perf['forename'] + ' ' + driver_perf['surname']
+    # CRITICAL FIX: Convert position to numeric and handle non-numeric values
+    driver_perf['position'] = pd.to_numeric(driver_perf['position'], errors='coerce')
+    # Calculate driver average position (only using valid numeric positions)
+    driver_avg_pos = driver_perf.groupby('driver_name')['position'].mean().reset_index()
+    driver_avg_pos.columns = ['driver_name', 'avg_race_position']
+    # Merge with lap data
+    lap_data = lap_data.merge(driver_avg_pos, on='driver_name', how='left')
+    # Create features
+    lap_features = lap_data.groupby(['driver_name', 'circuitId']).agg({
+        'milliseconds': 'mean',
+        'avg_race_position': 'first'
+    }).reset_index()
+  
+    lap_features['circuit_type'] = lap_features['circuitId'] % 3  
+    # Prepare for modeling
+    X = lap_features[['avg_race_position', 'circuit_type']]
+    y = lap_features['milliseconds']
+    # Handle missing values
+    X = X.fillna(X.mean())
+    # Remove any remaining rows with NaN values
+    valid_rows = ~(X.isna().any(axis=1) | y.isna())
+    X = X[valid_rows]
+    y = y[valid_rows]
+    if len(X) == 0:
+        print("   ⚠️ No valid data after cleaning")
+        return None
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Train model
+    lap_model = XGBRegressor(n_estimators=100, random_state=42)
+    lap_model.fit(X_train, y_train)
+    # Evaluate
+    y_pred = lap_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    print(f"   ✅ Lap time prediction model trained")
+    print(f"   📊 RMSE: {rmse:.0f} milliseconds")
+    # Feature importance
+    importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': lap_model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    print("   🔍 Feature Importance:")
+    for _, row in importance.iterrows():
+        print(f"      • {row['feature']}: {row['importance']:.3f}")
+    return lap_model
+
+# Build lap time predictor
+lap_time_model = build_lap_time_predictor(lap_times, races, drivers, results)
+
+def analyze_driver_form(results_clean, window_size=5):
+    """Analyze recent driver form using rolling window analysis"""
+    print("📉 Analyzing Driver Form Trends...")
+    # Create race sequence for each driver
+    form_data = results_clean[['driver_name', 'round', 'points']].copy()
+    form_data = form_data.sort_values(['driver_name', 'round'])
+    # Calculate rolling average points
+    form_data['rolling_points'] = form_data.groupby('driver_name')['points'].transform(
+        lambda x: x.rolling(window=window_size, min_periods=1).mean()
+    )
+    # Get latest form for each driver
+    latest_form = form_data.groupby('driver_name')['rolling_points'].last().reset_index()
+    latest_form = latest_form.merge(driver_metrics[['driver_name', 'performance_index']], on='driver_name')
+    # Identify improving vs declining drivers
+    latest_form['form_trend'] = np.where(
+        latest_form['rolling_points'] > latest_form['performance_index'] / 5,
+        'Improving',
+        'Declining'
+    )
+    # Visualize form trends
+    plt.figure(figsize=(14, 8))
+    colors = ['green' if x == 'Improving' else 'red' for x in latest_form['form_trend']]
+    plt.scatter(latest_form['performance_index'], 
+               latest_form['rolling_points'],
+               c=colors, s=100, alpha=0.7)
+    plt.xlabel('Overall Performance Index')
+    plt.ylabel(f'Rolling {window_size}-Race Average Points')
+    plt.title('Driver Form Analysis: Recent Performance vs Overall')
+    plt.grid(True, alpha=0.3)
+    # Add labels for top drivers
+    top_drivers = latest_form.nlargest(8, 'performance_index')
+    for i, row in top_drivers.iterrows():
+        plt.annotate(row['driver_name'].split()[-1], 
+                    (row['performance_index'] + 1, row['rolling_points']),
+                    fontsize=9)
+    plt.show()
+    print("   ✅ Driver form analysis completed")
+    print("   📊 Form Distribution:")
+    print(latest_form['form_trend'].value_counts())
+    return latest_form
+
+# Analyze driver form
+if len(results_clean) > 0:
+    form_analysis = analyze_driver_form(results_clean)
+
+def analyze_driver_form(results_clean, window_size=5):
+    """Analyze recent driver form using rolling window analysis"""
+    print("📉 Analyzing Driver Form Trends...")
+    # Create race sequence for each driver
+    form_data = results_clean[['driver_name', 'round', 'points']].copy()
+    form_data = form_data.sort_values(['driver_name', 'round'])
+    # Calculate rolling average points
+    form_data['rolling_points'] = form_data.groupby('driver_name')['points'].transform(
+        lambda x: x.rolling(window=window_size, min_periods=1).mean()
+    )
+    # Get latest form for each driver
+    latest_form = form_data.groupby('driver_name')['rolling_points'].last().reset_index()
+    latest_form = latest_form.merge(driver_metrics[['driver_name', 'performance_index']], on='driver_name')
+    # Identify improving vs declining drivers
+    latest_form['form_trend'] = np.where(
+        latest_form['rolling_points'] > latest_form['performance_index'] / 5,
+        'Improving',
+        'Declining'
+    )
+    # Visualize form trends
+    plt.figure(figsize=(14, 8))
+    colors = ['green' if x == 'Improving' else 'red' for x in latest_form['form_trend']]
+    plt.scatter(latest_form['performance_index'], 
+               latest_form['rolling_points'],
+               c=colors, s=100, alpha=0.7)
+    plt.xlabel('Overall Performance Index')
+    plt.ylabel(f'Rolling {window_size}-Race Average Points')
+    plt.title('Driver Form Analysis: Recent Performance vs Overall')
+    plt.grid(True, alpha=0.3)
+    # Add labels for top drivers
+    top_drivers = latest_form.nlargest(8, 'performance_index')
+    for i, row in top_drivers.iterrows():
+        plt.annotate(row['driver_name'].split()[-1], 
+                    (row['performance_index'] + 1, row['rolling_points']),
+                    fontsize=9)
+    plt.show()
+    print("   ✅ Driver form analysis completed")
+    print("   📊 Form Distribution:")
+    print(latest_form['form_trend'].value_counts())
+    return latest_form
+
+# Analyze driver form
+if len(results_clean) > 0:
+    form_analysis = analyze_driver_form(results_clean)
